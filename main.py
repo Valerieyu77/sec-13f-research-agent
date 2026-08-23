@@ -17,23 +17,49 @@ from __future__ import annotations
 
 import argparse
 import csv
+import json
 import re
 import sys
+import time
 from pathlib import Path
+
+import httpx
 
 ROOT = Path(__file__).resolve().parent
 FILERS = ROOT / "filers.csv"
 OUTPUT = ROOT / "output"
+CACHE = ROOT / ".cache"
 
-# Scope. See docs/01-source.md — filter report periods on reportDate, and exclude
+# Scope. See docs/01-source.md -- filter report periods on reportDate, and exclude
 # anything accepted after the cutoff.
 REPORT_PERIODS = ("2026-03-31", "2026-06-30")
 FILING_DATE_CUTOFF = "2026-08-18"  # inclusive
+FORMS_IN_SCOPE = {"13F-HR", "13F-HR/A", "13F-NT", "13F-NT/A"}
+
+CIK_LOOKUP_URL = "https://www.sec.gov/Archives/edgar/cik-lookup-data.txt"
 
 # SEC rejects requests without a contact address, and a run that gets the department
 # blocked is worth failing fast on. Loose on purpose: we check an address is present,
 # not that it is well-formed.
 UA_PATTERN = re.compile(r"^\S.*\s+[^@\s]+@[^@\s]+\.[a-z]{2,}\s*$", re.I)
+
+# Manually verified via SEC's EDGAR company search (browse-edgar) and cik-lookup-data.txt,
+# because automated name normalization either found nothing or matched a stale/incorrect
+# entity. See submission/ASSUMPTIONS.md for the reasoning behind each one.
+#
+#   Tudor Investment Corp: given CIK 854157 belongs to a different entity. The manager
+#     that actually files 13F as "Tudor Investment Corp" is CIK 923093.
+#   Situational Awareness LP: given CIK 1697748 does not resolve to any registrant.
+#     EDGAR company search finds "Situational Awareness LP", CIK 2045724 (distinct
+#     from the similarly-named "Situational Awareness Partners LP", CIK 2038540).
+#   The Baupost Group LLC: given CIK 1061768 initially looked wrong because
+#     cik-lookup-data.txt's closest name match, CIK 1054420 ("Baupost Group LLC /ADV"),
+#     stopped filing 13Fs in 2002. The given CIK 1061768 ("Baupost Group LLC/MA") is
+#     the entity that is currently active, so it was left as `given` -- not corrected.
+CIK_CORRECTIONS: dict[str, str] = {
+    "Tudor Investment Corp": "923093",
+    "Situational Awareness LP": "2045724",
+}
 
 
 def load_filers() -> list[dict[str, str]]:
@@ -42,21 +68,157 @@ def load_filers() -> list[dict[str, str]]:
         return list(csv.DictReader(fh))
 
 
+def verify_and_write_filers(user_agent: str, output: Path) -> list[dict[str, str]]:
+    """Chapter 1.1: reconcile filers.csv CIKs, write output/filers.csv.
+
+    Returns the corrected roster as a list of {fund_name, cik, cik_source} dicts.
+    """
+    filers = load_filers()
+
+    rows = []
+    for row in filers:
+        name = row["fund_name"]
+        given_cik = row["cik"].lstrip("0") or "0"
+
+        if name in CIK_CORRECTIONS:
+            cik = CIK_CORRECTIONS[name]
+            source = "corrected"
+        else:
+            cik = given_cik
+            source = "given"
+
+        rows.append({"fund_name": name, "cik": cik, "cik_source": source})
+
+    rows.sort(key=lambda r: int(r["cik"]))
+
+    output.mkdir(parents=True, exist_ok=True)
+    out_path = output / "filers.csv"
+    with out_path.open("w", newline="", encoding="utf-8") as fh:
+        writer = csv.DictWriter(fh, fieldnames=["fund_name", "cik", "cik_source"])
+        writer.writeheader()
+        writer.writerows(rows)
+
+    print(f"[source] wrote {len(rows)} rows to {out_path}")
+    return rows
+
+
+def fetch_submissions(cik: str, user_agent: str, client: httpx.Client) -> dict:
+    padded = cik.zfill(10)
+    url = f"https://data.sec.gov/submissions/CIK{padded}.json"
+    resp = client.get(url, headers={"User-Agent": user_agent}, timeout=10.0)
+    resp.raise_for_status()
+    return resp.json()
+
+
+def find_matching_filings(data: dict, fund_name: str, cik: str) -> list[dict]:
+    """Chapter 1.2: filter a manager's filings to the two in-scope 13F quarters."""
+    recent = data["filings"]["recent"]
+    matches = []
+    n = len(recent["accessionNumber"])
+    for i in range(n):
+        form = recent["form"][i]
+        report_date = recent["reportDate"][i]
+        filing_date = recent["filingDate"][i]
+        if (
+            form in FORMS_IN_SCOPE
+            and report_date in REPORT_PERIODS
+            and filing_date <= FILING_DATE_CUTOFF
+        ):
+            matches.append({
+                "fund_name": fund_name,
+                "cik": cik,
+                "accession_number": recent["accessionNumber"][i],
+                "form_type": form,
+                "report_date": report_date,
+                "filing_date": filing_date,
+            })
+    return matches
+
+
+def _index_json_url(cik: str, accession_nodash: str) -> str:
+    return f"https://www.sec.gov/Archives/edgar/data/{cik}/{accession_nodash}/index.json"
+
+
+def _doc_url(cik: str, accession_nodash: str, filename: str) -> str:
+    return f"https://www.sec.gov/Archives/edgar/data/{cik}/{accession_nodash}/{filename}"
+
+
+def _find_info_table_filename(index_data: dict) -> str | None:
+    """The information table is whichever XML in the filing isn't primary_doc.xml."""
+    items = index_data["directory"]["item"]
+    xml_files = [item["name"] for item in items if item["name"].lower().endswith(".xml")]
+    candidates = [f for f in xml_files if f.lower() != "primary_doc.xml"]
+    if len(candidates) == 1:
+        return candidates[0]
+    return None
+
+
+def download_filing(
+    cik: str, accession: str, user_agent: str, output: Path, client: httpx.Client
+) -> tuple[str, Path | None]:
+    """Chapter 1.3/1.4: download one filing's information table (or cover page for
+    notices), caching to disk so re-runs skip work already done."""
+    accession_nodash = accession.replace("-", "")
+    filings_dir = output / "filings" / cik
+    filings_dir.mkdir(parents=True, exist_ok=True)
+    out_path = filings_dir / f"{accession_nodash}.xml"
+
+    if out_path.exists():
+        return "cached", out_path
+
+    idx_resp = client.get(
+        _index_json_url(cik, accession_nodash),
+        headers={"User-Agent": user_agent},
+        timeout=10.0,
+    )
+    idx_resp.raise_for_status()
+    index_data = idx_resp.json()
+    time.sleep(0.12)
+
+    filename = _find_info_table_filename(index_data)
+    doc_kind = "info_table"
+    if filename is None:
+        filename = "primary_doc.xml"
+        doc_kind = "primary_doc_only (notice)"
+
+    doc_resp = client.get(
+        _doc_url(cik, accession_nodash, filename),
+        headers={"User-Agent": user_agent},
+        timeout=10.0,
+    )
+    doc_resp.raise_for_status()
+    time.sleep(0.12)
+
+    out_path.write_bytes(doc_resp.content)
+    return doc_kind, out_path
+
+
 def run(user_agent: str, output: Path) -> None:
     """Build the dataset.
 
-    Suggested shape, not a requirement:
-
-        1. verify the CIKs against SEC's lookup file      docs/01-source.md
-        2. find in-scope filings via the submissions API
-        3. download the filings, caching as you go
-        4. parse into the schema                          docs/SCHEMA.md
-        5. write output/filings.parquet and output/holdings.parquet
+    Chapter 1 (this pass): verify CIKs, find in-scope filings, download and cache them.
+    Chapter 3 (next pass): parse the cached XML into output/filings.parquet and
+    output/holdings.parquet.
     """
-    raise NotImplementedError(
-        "Implement your pipeline here. Start with docs/01-source.md, then "
-        "docs/SCHEMA.md for the output contract."
-    )
+    filers = verify_and_write_filers(user_agent, output)
+
+    all_matches: list[dict] = []
+    with httpx.Client() as client:
+        for row in filers:
+            cik = row["cik"]
+            name = row["fund_name"]
+            data = fetch_submissions(cik, user_agent, client)
+            matches = find_matching_filings(data, name, cik)
+            all_matches.extend(matches)
+            time.sleep(0.12)
+
+        print(f"[source] found {len(all_matches)} in-scope filings (expected 40)")
+
+        for m in all_matches:
+            status, path = download_filing(m["cik"], m["accession_number"], user_agent, output, client)
+            print(f"[source] {m['fund_name']:<40} {m['report_date']}  {status:<25} {path}")
+
+    print("[source] chapter 1 complete -- parquet writing (chapter 3) not yet implemented")
 
 
 def main() -> int:
