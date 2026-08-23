@@ -24,6 +24,10 @@ import time
 from pathlib import Path
 
 import httpx
+from datetime import date
+from xml.etree import ElementTree as ET
+import pyarrow as pa
+import pyarrow.parquet as pq
 
 ROOT = Path(__file__).resolve().parent
 FILERS = ROOT / "filers.csv"
@@ -218,14 +222,124 @@ def download_filing(
 
     return " ".join(statuses), info_path
 
+def local_name(tag: str) -> str:
+    return tag.split("}", 1)[1] if "}" in tag else tag
+
+
+def _find_text(root, name: str) -> str | None:
+    """First descendant element whose local (namespace-stripped) tag matches `name`."""
+    for el in root.iter():
+        if local_name(el.tag) == name:
+            return el.text
+    return None
+
+
+def parse_cover(cover_path: Path, form_type: str, report_date: str, filing_date: str) -> dict:
+    """Chapter 3: extract a filings.parquet row from a cover page (primary_doc.xml)."""
+    tree = ET.parse(cover_path)
+    root = tree.getroot()
+
+    report_period = date.fromisoformat(report_date)
+    report_quarter = f"{report_period.year}Q{(report_period.month - 1) // 3 + 1}"
+
+    filing_manager = _find_text(root, "name")  # filingManager/name
+    report_type = _find_text(root, "reportType")
+    form_13f_file_number = _find_text(root, "form13FFileNumber")
+    crd_number = _find_text(root, "crdNumber")
+    sec_file_number = _find_text(root, "secFileNumber")
+
+    other_included_managers_count = _find_text(root, "otherIncludedManagersCount")
+    table_entry_total = _find_text(root, "tableEntryTotal")
+    table_value_total = _find_text(root, "tableValueTotal")
+
+    amendment_no = _find_text(root, "amendmentNo")
+    amendment_type = _find_text(root, "amendmentType")
+
+    return {
+        "cik": None,  # filled in by caller
+        "fund_name": None,  # filled in by caller
+        "filing_manager": filing_manager,
+        "form_type": form_type,
+        "report_period": report_period,
+        "report_quarter": report_quarter,
+        "filing_date": date.fromisoformat(filing_date),
+        "is_amendment": form_type.endswith("/A"),
+        "amendment_no": int(amendment_no) if amendment_no else None,
+        "amendment_type": amendment_type,
+        "report_type": report_type,
+        "form_13f_file_number": form_13f_file_number,
+        "crd_number": crd_number,
+        "sec_file_number": sec_file_number,
+        "other_included_managers_count": (
+            int(other_included_managers_count) if other_included_managers_count is not None else None
+        ),
+        "table_entry_total": int(table_entry_total) if table_entry_total is not None else None,
+        "table_value_total": int(table_value_total) if table_value_total is not None else None,
+    }
+
+
+def parse_holdings(info_path: Path, cik: str, report_quarter: str) -> list[dict]:
+    """Chapter 3: extract holdings.parquet rows from an information table.
+
+    Matches child elements by namespace-stripped local name, since filers use
+    inconsistent namespace prefixes (none, ns1:, n1:) for the identical schema.
+    """
+    tree = ET.parse(info_path)
+    root = tree.getroot()
+
+    rows = []
+    for entry in root.iter():
+        if local_name(entry.tag) != "infoTable":
+            continue
+
+        fields: dict[str, str] = {}
+        ssh_prnamt = None
+        ssh_prnamt_type = None
+        voting_sole = voting_shared = voting_none = None
+
+        for child in entry:
+            name = local_name(child.tag)
+            if name == "shrsOrPrnAmt":
+                for gc in child:
+                    gname = local_name(gc.tag)
+                    if gname == "sshPrnamt":
+                        ssh_prnamt = gc.text
+                    elif gname == "sshPrnamtType":
+                        ssh_prnamt_type = gc.text
+            elif name == "votingAuthority":
+                for gc in child:
+                    gname = local_name(gc.tag)
+                    if gname == "Sole":
+                        voting_sole = gc.text
+                    elif gname == "Shared":
+                        voting_shared = gc.text
+                    elif gname == "None":
+                        voting_none = gc.text
+            else:
+                fields[name] = child.text
+
+        rows.append({
+            "cik": cik,
+            "report_quarter": report_quarter,
+            "name_of_issuer": fields.get("nameOfIssuer"),
+            "title_of_class": fields.get("titleOfClass"),
+            "cusip": fields.get("cusip"),
+            "figi": fields.get("figi"),
+            "value": int(fields["value"]),
+            "ssh_prnamt": int(ssh_prnamt),
+            "ssh_prnamt_type": ssh_prnamt_type,
+            "put_call": fields.get("putCall"),
+            "investment_discretion": fields.get("investmentDiscretion"),
+            "other_manager": fields.get("otherManager"),
+            "voting_sole": int(voting_sole),
+            "voting_shared": int(voting_shared),
+            "voting_none": int(voting_none),
+        })
+    return rows
+
 
 def run(user_agent: str, output: Path) -> None:
-    """Build the dataset.
-
-    Chapter 1 (this pass): verify CIKs, find in-scope filings, download and cache them.
-    Chapter 3 (next pass): parse the cached XML into output/filings.parquet and
-    output/holdings.parquet.
-    """
+    """Build the dataset: verify CIKs, find/download filings, parse into Parquet."""
     filers = verify_and_write_filers(user_agent, output)
 
     all_matches: list[dict] = []
@@ -235,6 +349,8 @@ def run(user_agent: str, output: Path) -> None:
             name = row["fund_name"]
             data = fetch_submissions(cik, user_agent, client)
             matches = find_matching_filings(data, name, cik)
+            # deterministic order: earliest report_date first
+            matches.sort(key=lambda m: m["report_date"])
             all_matches.extend(matches)
             time.sleep(0.12)
 
@@ -242,9 +358,80 @@ def run(user_agent: str, output: Path) -> None:
 
         for m in all_matches:
             status, path = download_filing(m["cik"], m["accession_number"], m["form_type"], user_agent, output, client)
-            print(f"[source] {m['fund_name']:<40} {m['report_date']}  {status:<25} {path}")
+            print(f"[source] {m['fund_name']:<40} {m['report_date']}  {status:<30} {path}")
 
-    print("[source] chapter 1 complete -- parquet writing (chapter 3) not yet implemented")
+    # ---- Chapter 3: parse into filings.parquet / holdings.parquet ----------------
+    filings_rows = []
+    holdings_rows = []
+
+    for m in all_matches:
+        cik = m["cik"].zfill(10)
+        accession_nodash = m["accession_number"].replace("-", "")
+        cik_dir = output / "filings" / m["cik"]
+        cover_path = cik_dir / f"{accession_nodash}_cover.xml"
+        info_path = cik_dir / f"{accession_nodash}.xml"
+
+        cover_row = parse_cover(cover_path, m["form_type"], m["report_date"], m["filing_date"])
+        cover_row["accession_number"] = m["accession_number"]
+        cover_row["cik"] = cik
+        cover_row["fund_name"] = m["fund_name"]
+        filings_rows.append(cover_row)
+
+        if info_path.exists():
+            for h in parse_holdings(info_path, cik, cover_row["report_quarter"]):
+                h["accession_number"] = m["accession_number"]
+                holdings_rows.append(h)
+
+    filings_schema = pa.schema([
+        ("accession_number", pa.string()),
+        ("cik", pa.string()),
+        ("fund_name", pa.string()),
+        ("filing_manager", pa.string()),
+        ("form_type", pa.string()),
+        ("report_period", pa.date32()),
+        ("report_quarter", pa.string()),
+        ("filing_date", pa.date32()),
+        ("is_amendment", pa.bool_()),
+        ("amendment_no", pa.int32()),
+        ("amendment_type", pa.string()),
+        ("report_type", pa.string()),
+        ("form_13f_file_number", pa.string()),
+        ("crd_number", pa.string()),
+        ("sec_file_number", pa.string()),
+        ("other_included_managers_count", pa.int32()),
+        ("table_entry_total", pa.int64()),
+        ("table_value_total", pa.int64()),
+    ])
+    holdings_schema = pa.schema([
+        ("accession_number", pa.string()),
+        ("cik", pa.string()),
+        ("report_quarter", pa.string()),
+        ("name_of_issuer", pa.string()),
+        ("title_of_class", pa.string()),
+        ("cusip", pa.string()),
+        ("figi", pa.string()),
+        ("value", pa.int64()),
+        ("ssh_prnamt", pa.int64()),
+        ("ssh_prnamt_type", pa.string()),
+        ("put_call", pa.string()),
+        ("investment_discretion", pa.string()),
+        ("other_manager", pa.string()),
+        ("voting_sole", pa.int64()),
+        ("voting_shared", pa.int64()),
+        ("voting_none", pa.int64()),
+    ])
+
+    filings_cols = {name: [r.get(name) for r in filings_rows] for name in filings_schema.names}
+    holdings_cols = {name: [r.get(name) for r in holdings_rows] for name in holdings_schema.names}
+
+    filings_table = pa.table(filings_cols, schema=filings_schema)
+    holdings_table = pa.table(holdings_cols, schema=holdings_schema)
+
+    pq.write_table(filings_table, output / "filings.parquet", compression="snappy")
+    pq.write_table(holdings_table, output / "holdings.parquet", compression="snappy")
+
+    print(f"[structure] wrote {len(filings_rows)} rows to output/filings.parquet (expected 40)")
+    print(f"[structure] wrote {len(holdings_rows)} rows to output/holdings.parquet")
 
 
 def main() -> int:
