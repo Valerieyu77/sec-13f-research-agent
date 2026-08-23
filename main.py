@@ -154,43 +154,69 @@ def _find_info_table_filename(index_data: dict) -> str | None:
 
 
 def download_filing(
-    cik: str, accession: str, user_agent: str, output: Path, client: httpx.Client
+    cik: str, accession: str, form_type: str, user_agent: str, output: Path, client: httpx.Client
 ) -> tuple[str, Path | None]:
-    """Chapter 1.3/1.4: download one filing's information table (or cover page for
-    notices), caching to disk so re-runs skip work already done."""
+    """Chapter 1.3/1.4: download a filing's cover page and information table (when one
+    exists), caching each to disk so re-runs skip work already done.
+
+    We cache the cover page (primary_doc.xml) in addition to the information table
+    because filings.parquet needs cover-page-only fields (filing_manager, crd_number,
+    table_entry_total, etc.) that Chapter 3 requires -- see submission/ASSUMPTIONS.md.
+    """
     accession_nodash = accession.replace("-", "")
     filings_dir = output / "filings" / cik
     filings_dir.mkdir(parents=True, exist_ok=True)
-    out_path = filings_dir / f"{accession_nodash}.xml"
 
-    if out_path.exists():
-        return "cached", out_path
+    info_path = filings_dir / f"{accession_nodash}.xml"
+    cover_path = filings_dir / f"{accession_nodash}_cover.xml"
 
-    idx_resp = client.get(
-        _index_json_url(cik, accession_nodash),
-        headers={"User-Agent": user_agent},
-        timeout=10.0,
-    )
-    idx_resp.raise_for_status()
-    index_data = idx_resp.json()
-    time.sleep(0.12)
+    need_index = not (info_path.exists() and cover_path.exists())
+    index_data = None
+    if need_index:
+        idx_resp = client.get(
+            _index_json_url(cik, accession_nodash),
+            headers={"User-Agent": user_agent},
+            timeout=10.0,
+        )
+        idx_resp.raise_for_status()
+        index_data = idx_resp.json()
+        time.sleep(0.12)
 
-    filename = _find_info_table_filename(index_data)
-    doc_kind = "info_table"
-    if filename is None:
-        filename = "primary_doc.xml"
-        doc_kind = "primary_doc_only (notice)"
+    statuses = []
 
-    doc_resp = client.get(
-        _doc_url(cik, accession_nodash, filename),
-        headers={"User-Agent": user_agent},
-        timeout=10.0,
-    )
-    doc_resp.raise_for_status()
-    time.sleep(0.12)
+    # Cover page (always present)
+    if cover_path.exists():
+        statuses.append("cover=cached")
+    else:
+        doc_resp = client.get(
+            _doc_url(cik, accession_nodash, "primary_doc.xml"),
+            headers={"User-Agent": user_agent},
+            timeout=10.0,
+        )
+        doc_resp.raise_for_status()
+        time.sleep(0.12)
+        cover_path.write_bytes(doc_resp.content)
+        statuses.append("cover=fetched")
 
-    out_path.write_bytes(doc_resp.content)
-    return doc_kind, out_path
+    # Information table (absent for notices)
+    if info_path.exists():
+        statuses.append("info_table=cached")
+    else:
+        filename = _find_info_table_filename(index_data) if index_data else None
+        if filename is None:
+            statuses.append("info_table=none (notice)")
+        else:
+            doc_resp = client.get(
+                _doc_url(cik, accession_nodash, filename),
+                headers={"User-Agent": user_agent},
+                timeout=10.0,
+            )
+            doc_resp.raise_for_status()
+            time.sleep(0.12)
+            info_path.write_bytes(doc_resp.content)
+            statuses.append("info_table=fetched")
+
+    return " ".join(statuses), info_path
 
 
 def run(user_agent: str, output: Path) -> None:
@@ -215,7 +241,7 @@ def run(user_agent: str, output: Path) -> None:
         print(f"[source] found {len(all_matches)} in-scope filings (expected 40)")
 
         for m in all_matches:
-            status, path = download_filing(m["cik"], m["accession_number"], user_agent, output, client)
+            status, path = download_filing(m["cik"], m["accession_number"], m["form_type"], user_agent, output, client)
             print(f"[source] {m['fund_name']:<40} {m['report_date']}  {status:<25} {path}")
 
     print("[source] chapter 1 complete -- parquet writing (chapter 3) not yet implemented")
