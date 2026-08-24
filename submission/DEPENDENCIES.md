@@ -1,22 +1,14 @@
 # Dependencies
 
-Every library you added to `requirements-extra.txt`, with a one-line reason.
-
-We are not counting libraries — a well-chosen dependency is better engineering than a
-hand-rolled version of the same thing. What we are reading is whether you added each
-one deliberately.
-
 | Library | Version | Why |
 |---|---|---|
-| *example* | *2.1.0* | *replace this row* |
+| pandas | 3.0.5 | Used in `agents/answer.py` for grouping, filtering, and aggregating `filings.parquet`/`holdings.parquet` (e.g. summing `value` by manager, computing quarter-over-quarter deltas). `pyarrow` alone (already in `requirements.txt`) is sufficient for reading/writing Parquet but far more verbose for this kind of tabular aggregation; pandas is the standard tool for it and keeps the agent's query logic readable. |
 
 ## Anything you considered and rejected
 
-Optional, but the more interesting half. A library you looked at and decided against —
-and why — says more than the ones you kept.
-
-## Note
-
-Libraries that wrap 13F retrieval and parsing end to end will not, on their own,
-satisfy the schema or the quality report, and we will ask you to explain the edge cases
-in your output regardless of how you produced it. If you can explain it, you own it.
+Considered using `pyarrow.compute` directly for the aggregations in `agents/answer.py`
+to avoid adding a dependency, since `pyarrow` is already required. Rejected it because
+the multi-step groupby/unstack logic needed for quarter-over-quarter comparisons
+(Chapter 4's "who added the most Nvidia shares" style questions) is substantially more
+verbose and harder to get right in raw `pyarrow.compute` than in pandas, and this is
+exactly the kind of question a researcher using this tool would actually ask.
