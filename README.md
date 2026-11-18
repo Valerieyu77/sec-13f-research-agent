@@ -1,140 +1,115 @@
-# DSRS Data Curator Challenge
+# SEC 13F Research Agent
 
-Fetch SEC 13F filings from EDGAR, structure them into a dataset a researcher can trust,
-and make it accessible through an agent.
+**A Python data pipeline and LLM-assisted research agent for exploring institutional investment holdings from SEC EDGAR filings.**
 
-**Start with [docs/CHALLENGE.md](docs/CHALLENGE.md)** — what to build, how it is scored,
-and what to submit.
+Developed for the 2026 DSRS Data Curator Challenge at the University of Illinois Urbana-Champaign.
 
----
+## Overview
 
-## Getting your repo
+SEC Form 13F filings disclose quarterly holdings reported by institutional investment managers. Although the filings are publicly available, analyzing them across managers and reporting periods requires collecting, validating, and standardizing data from multiple disclosures.
 
-1. **Sign in to GitHub**, then
-   [create your repository from this template](https://github.com/GiesDSRS/dsrs-curator/generate)
-2. Name it, set visibility to **Private**, and create it
-3. **Settings → Collaborators → Add people → `dsrsBOT`**, Read access
-4. Clone it and start
+This project combines two components:
 
-Use the link above rather than the **Fork** button — a fork of a public repository is
-always public, and your work needs to stay private until results are announced.
+- **Data pipeline:** Retrieves SEC filings, reconciles manager identifiers, parses disclosures, and produces structured Parquet datasets.
+- **Research agent:** Interprets natural-language questions and uses structured data queries to investigate institutional holdings.
 
-Step 3 is the one people forget. Without it we cannot read your repository, and there is
-no submission to grade.
+The goal is to make public financial disclosures easier to explore while keeping the underlying data and assumptions traceable.
 
----
+## Key Features
 
-## Setup
+### 1. SEC EDGAR Data Collection
 
-Python 3.12.
+- Processes a roster of 20 institutional investment managers.
+- Retrieves relevant Form 13F filings for two quarterly reporting periods.
+- Validates Central Index Key (CIK) identifiers against SEC records.
+- Handles filing selection, data retrieval, and local caching.
+
+### 2. Data Cleaning and Structuring
+
+- Parses SEC filing data into structured records.
+- Standardizes holdings information across different filing formats.
+- Documents data-quality issues and assumptions.
+- Exports filing-level and holdings-level datasets in Apache Parquet format.
+
+### 3. LLM-Assisted Research Agent
+
+- Accepts natural-language questions about institutional holdings.
+- Interprets questions and maps them to structured analytical operations.
+- Uses Python-based queries to retrieve and compare holdings data.
+- Supports traceable answers grounded in the underlying dataset.
+
+## Tech Stack
+
+| Category | Technologies |
+|---|---|
+| Language | Python |
+| Data processing | PyArrow, CSV, XML |
+| Data source | SEC EDGAR |
+| Storage | Apache Parquet |
+| AI integration | LLM-assisted query interpretation |
+| Development | Git, Docker |
+
+## Project Structure
+
+```text
+main.py                 # SEC data collection and processing pipeline
+agents/
+  answer.py             # Natural-language research agent
+  llm.py                # LLM interface supplied by the challenge
+submission/
+  ASSUMPTIONS.md        # Data decisions and validation notes
+  SUBMISSION.md         # Original competition submission
+docs/                   # Challenge documentation
+output/                 # Generated structured datasets
+tests/                  # Project tests
+verify.py               # Dataset verification
+```
+
+Some infrastructure and validation files were provided by the challenge organizers. The repository preserves the original competition structure.
+
+## Getting Started
+
+Requires Python 3.12.
 
 ```bash
 pip install -r requirements.txt -r requirements-extra.txt
-cp .env.example .env          # then fill in your model endpoint
-python -m agents.llm          # confirms the connection works
+cp .env.example .env
 ```
 
-Or build the image we grade in:
+Configure the model endpoint in `.env`, then run:
 
 ```bash
-docker build -f Dockerfile.base -t curator-base .
-docker build -t curator-submission .
-docker run --rm -v "$PWD/output:/app/output" -v "$PWD/.cache:/app/.cache" \
-  curator-submission --user-agent "FirstName LastName netid@illinois.edu"
+python main.py --user-agent "Your Name email@example.com"
 ```
 
-Building in Docker at least once before you submit is worth the ten minutes. Most
-grading failures are environment differences rather than logic errors.
-
----
-
-## Commands
+To ask a research question:
 
 ```bash
-python main.py --user-agent "FirstName LastName netid@illinois.edu"
-python -m agents.answer "which manager held the most Nvidia in 2026 Q2?"
+python -m agents.answer "Which manager held the most Nvidia in 2026 Q2?"
+```
+
+To validate the generated dataset:
+
+```bash
 python verify.py
-python check_submission.py
 ```
 
-`main.py` and `agents/answer.py` are how we run your submission. They must work from a
-clean checkout.
+The pipeline uses the SEC EDGAR API. A valid identifying User-Agent is required.
 
----
+## Data Quality Considerations
 
-## Layout
+Institutional filings can contain inconsistencies that affect downstream analysis.
 
-```
-main.py               your pipeline — the entry point we call
-agents/
-  llm.py              model access (frozen)
-  answer.py           your agent — main(question) -> dict
-docs/                 read these before you start
-submission/           fill these in before you submit
-filers.csv            the roster: twenty managers, CIKs not all trustworthy
-output/               your outputs land here, and are committed
-verify.py             checks your Parquet against the schema (frozen)
-check_submission.py   checks your submission is complete (frozen)
-tests/                yours
-```
+For example, the challenge's initial manager roster included incorrect CIK identifiers. These were checked against SEC records rather than relying only on name similarity.
 
----
+The project also documents decisions related to filing formats, identifiers, and data integrity.
 
-## Frozen files
+See [ASSUMPTIONS.md](submission/ASSUMPTIONS.md) for additional details.
 
-Do not edit these. Modifications are detected and the original is restored before
-grading, so changes are discarded rather than penalised — but your code then runs
-against the original.
+## Project Background
 
-```
-verify.py  check_submission.py  agents/llm.py
-filers.csv  requirements.txt  Dockerfile.base
-```
+This project was completed as part of the **DSRS Data Curator Challenge (2026)**.
 
-Add your dependencies to `requirements-extra.txt`, pinned, and justify each in
-`submission/DEPENDENCIES.md`.
+The challenge provided the project specification, starter repository, and certain supporting files. My implementation focused on building the data processing pipeline, investigating data-quality issues, and implementing the research agent.
 
-If something in a frozen file looks broken, email dsrs@business.illinois.edu rather than
-working around it locally.
-
----
-
-## What you commit
-
-| Path | Chapter |
-|---|---|
-| `output/filers.csv` | 1 · Source |
-| `output/filings/` | 1 · Source |
-| `submission/eda.py` | 2 · Interrogate |
-| `output/filings.parquet`, `output/holdings.parquet` | 3 · Structure |
-| `agents/answer.py`, `output/agent_usage.json` | 4 · Serve |
-| `submission/SUBMISSION.md` (with video link) | 5 · Show |
-| `submission/ASSUMPTIONS.md`, `AI_USAGE.md`, `DEPENDENCIES.md` | required |
-
-`output/` is committed — it is the submission. `.cache/` and `.env` are not.
-
----
-
-## EDGAR
-
-You fetch from live EDGAR. A `User-Agent` carrying your name and email is required, and
-SEC caps clients at 10 requests per second. Cache what you download and resume rather
-than restart: your pipeline is run twice, and the second run must produce byte-identical
-output.
-
-Details in [docs/01-source.md](docs/01-source.md).
-
----
-
-## Before you submit
-
-```bash
-python verify.py            # your Parquet matches the schema
-python check_submission.py  # everything required is committed and pushed
-```
-
-Then work through the checklist in
-[submission/SUBMISSION.md](submission/SUBMISSION.md).
-
-**Deadline: Monday, August 24, 2026, 11:59 AM US Central.** Your code is not frozen at
-submission — we take the last commit before the deadline, so keep pushing until then.
+The repository is maintained as a portfolio project demonstrating data engineering, structured financial analysis, and LLM integration.
